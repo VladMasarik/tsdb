@@ -264,69 +264,103 @@ func (q *blockQuerier) Close() error {
 // based on the given matchers. It returns a list of label names that must be manually
 // checked to not exist in series the postings list points to.
 func PostingsForMatchers(ix IndexReader, ms ...labels.Matcher) (index.Postings, error) {
-	var its []index.Postings
+	var its, notIts []index.Postings
+  // See which labelnames must be non-empty.
+  labelnameMustBeSet := make(map[string]bool, len(ms))
+	for _, m := range ms {
+    if !m.Matches("") {
+      labelnameMustBeSet[m.Name()] = true
+    }
+  }
 
 	for _, m := range ms {
-		it, err := postingsForMatcher(ix, m)
-		if err != nil {
-			return nil, err
-		}
-		its = append(its, it)
+    if labelnameMustBeSet[m.Name()] || !m.Matches("") {
+      if nm, isNot := m.(*labels.NotMatcher); isNot && m.Matches("") {
+        // If the label can't be empty and is a Not, then
+        // subtract it out at the end.
+        it, err := inversePostingsForMatcher(ix, nm.Matcher)
+        if err != nil {
+          return nil, err
+        }
+        notIts = append(notIts, it)
+      } else {
+        it, err := postingsForMatcher(ix, m)
+        if err != nil {
+          return nil, err
+        }
+        its = append(its, it)
+      }
+    } else {
+      // If the matchers for a labelname selects an empty value, it selects all
+      // the series which don't have the label name set too. See:
+      // https://github.com/prometheus/prometheus/issues/3575 and
+      // https://github.com/prometheus/prometheus/pull/3578#issuecomment-351653555
+      it, err := inversePostingsForMatcher(ix, m)
+      if err != nil {
+        return nil, err
+      }
+      notIts = append(notIts, it)
+    }
 	}
-	return ix.SortedPostings(index.Intersect(its...)), nil
+
+  // If there's nothing to subtract from, add in everything.
+  if len(its) == 0 && len(notIts) != 0 {
+    allPostings, err := ix.Postings(index.AllPostingsKey())
+    if err != nil {
+      return nil, err
+    }
+    its = append(its, allPostings)
+  }
+
+  it := index.Intersect(its...)
+
+  for _, n := range notIts {
+    it = index.Without(it, n)
+  }
+
+	return ix.SortedPostings(it), nil
 }
 
 func postingsForMatcher(ix IndexReader, m labels.Matcher) (index.Postings, error) {
-	// If the matcher selects an empty value, it selects all the series which don't
-	// have the label name set too. See: https://github.com/prometheus/prometheus/issues/3575
-	// and https://github.com/prometheus/prometheus/pull/3578#issuecomment-351653555
-	if m.Matches("") {
-		return postingsForUnsetLabelMatcher(ix, m)
-	}
+  // Fast-path for equal matching.
+  if em, ok := m.(*labels.EqualMatcher); ok {
+    return ix.Postings(em.Name(), em.Value())
+  }
 
-	// Fast-path for equal matching.
-	if em, ok := m.(*labels.EqualMatcher); ok {
-		it, err := ix.Postings(em.Name(), em.Value())
-		if err != nil {
-			return nil, err
-		}
-		return it, nil
-	}
+  tpls, err := ix.LabelValues(m.Name())
+  if err != nil {
+    return nil, err
+  }
 
-	tpls, err := ix.LabelValues(m.Name())
-	if err != nil {
-		return nil, err
-	}
+  var res []string
+  for i := 0; i < tpls.Len(); i++ {
+    vals, err := tpls.At(i)
+    if err != nil {
+      return nil, err
+    }
+    if m.Matches(vals[0]) {
+      res = append(res, vals[0])
+    }
+  }
 
-	var res []string
-	for i := 0; i < tpls.Len(); i++ {
-		vals, err := tpls.At(i)
-		if err != nil {
-			return nil, err
-		}
-		if m.Matches(vals[0]) {
-			res = append(res, vals[0])
-		}
-	}
+  if len(res) == 0 {
+    return index.EmptyPostings(), nil
+  }
 
-	if len(res) == 0 {
-		return index.EmptyPostings(), nil
-	}
+  var rit []index.Postings
 
-	var rit []index.Postings
+  for _, v := range res {
+    it, err := ix.Postings(m.Name(), v)
+    if err != nil {
+      return nil, err
+    }
+    rit = append(rit, it)
+  }
 
-	for _, v := range res {
-		it, err := ix.Postings(m.Name(), v)
-		if err != nil {
-			return nil, err
-		}
-		rit = append(rit, it)
-	}
-
-	return index.Merge(rit...), nil
+  return index.Merge(rit...), nil
 }
 
-func postingsForUnsetLabelMatcher(ix IndexReader, m labels.Matcher) (index.Postings, error) {
+func inversePostingsForMatcher(ix IndexReader, m labels.Matcher) (index.Postings, error) {
 	tpls, err := ix.LabelValues(m.Name())
 	if err != nil {
 		return nil, err
@@ -366,11 +400,7 @@ func postingsForUnsetLabelMatcher(ix IndexReader, m labels.Matcher) (index.Posti
 		merged = index.NewListPostings(pl)
 	}
 
-	allPostings, err := ix.Postings(index.AllPostingsKey())
-	if err != nil {
-		return nil, err
-	}
-	return index.Without(allPostings, merged), nil
+	return merged, nil
 }
 
 func mergeStrings(a, b []string) []string {

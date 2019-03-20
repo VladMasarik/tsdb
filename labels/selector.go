@@ -87,14 +87,14 @@ func NewMustRegexpMatcher(name, pattern string) Matcher {
 
 }
 
-// notMatcher inverts the matching result for a matcher.
-type notMatcher struct {
+// NotMatcher inverts the matching result for a matcher.
+type NotMatcher struct {
 	Matcher
 }
 
-func (m *notMatcher) Matches(v string) bool { return !m.Matcher.Matches(v) }
+func (m *NotMatcher) Matches(v string) bool { return !m.Matcher.Matches(v) }
 
 // Not inverts the matcher's matching result.
 func Not(m Matcher) Matcher {
-	return &notMatcher{m}
+	return &NotMatcher{m}
 }
